@@ -1,0 +1,10 @@
+FinMind
+yfinance
+pandas
+numpy
+plotly
+streamlit
+matplotlib
+python-dateutil
+requests
+streamlit-lightweight-charts
