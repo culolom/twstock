@@ -38,12 +38,21 @@ def max_drawdown(series):
 # UI 設定
 ###############################################################
 
+def normalize_symbol(symbol: str) -> str:
+    symbol = symbol.strip()
+    if symbol and not symbol.upper().endswith(".TW"):
+        symbol = f"{symbol}.TW"
+    return symbol
+
+
 col1, col2 = st.columns(2)
 with col1:
-    market_symbol = st.text_input("大盤代號（預設 0050.TW）", "0050.TW")
+    market_symbol_input = st.text_input("大盤代號（預設 0050，系統自動補 .TW）", "0050")
+    market_symbol = normalize_symbol(market_symbol_input)
 
 with col2:
-    stock_symbol = st.text_input("個股代號（例如：2330.TW）", "2330.TW")
+    stock_symbol_input = st.text_input("個股代號（例如：2330，系統自動補 .TW）", "2330")
+    stock_symbol = normalize_symbol(stock_symbol_input)
 
 start = st.date_input("開始日期", dt.date(2010,1,1))
 end   = st.date_input("結束日期", dt.date.today())
@@ -57,8 +66,10 @@ if st.button("開始回測 🚀"):
     ###############################################################
     st.write("⏳ 下載資料中...")
 
-    mkt = fetch_price(market_symbol, start - dt.timedelta(days=400), end)
-    stk = fetch_price(stock_symbol, start - dt.timedelta(days=400), end)
+    data_fetch_start = dt.date(1990, 1, 1)
+
+    mkt = fetch_price(market_symbol, data_fetch_start, end)
+    stk = fetch_price(stock_symbol, data_fetch_start, end)
 
     if mkt.empty or stk.empty:
         st.error("⚠️ 資料下載失敗，請確認股票代號")
@@ -67,8 +78,6 @@ if st.button("開始回測 🚀"):
     df = pd.DataFrame(index = mkt.index)
     df["Mkt"] = mkt["Price"]
     df = df.join(stk["Price"].rename("Stock"), how="inner")
-
-    df = df[df.index >= pd.to_datetime(start)]
 
     ###############################################################
     # 計算指標：200SMA + 6M 報酬
@@ -81,6 +90,20 @@ if st.button("開始回測 🚀"):
     df["Stk_6m"] = df["Stock"].pct_change(126)
 
     df = df.dropna()
+
+    if df.empty:
+        st.error("⚠️ 無足夠資料進行回測，請確認股票代號")
+        st.stop()
+
+    earliest_backtest_date = df.index.min()
+
+    st.info(f"最早可回測日期：{earliest_backtest_date.date()}")
+
+    df = df[df.index >= pd.to_datetime(start)]
+
+    if df.empty:
+        st.error("⚠️ 無足夠資料進行回測，請調整開始日期或股票代號")
+        st.stop()
 
     ###############################################################
     # 三條件訊號
