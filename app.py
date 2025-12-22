@@ -5,114 +5,147 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime, timedelta
 import time
+import urllib3
 
-# 設定頁面資訊
+# 1. 初始化設定與忽略 SSL 警告
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
 st.set_page_config(page_title="倉鼠量化戰情室", layout="wide", page_icon="🐹")
 
-# --- CSS 樣式美化 ---
+# 自定義 CSS 讓介面更專業
 st.markdown("""
     <style>
-    .main { background-color: #f5f7f9; }
-    .stButton>button { width: 100%; border-radius: 5px; height: 3em; background-color: #ff4b4b; color: white; }
+    .stProgress > div > div > div > div { background-image: linear-gradient(to right, #4facfe 0%, #00f2fe 100%); }
+    .stDataFrame { border: 1px solid #e6e9ef; border-radius: 10px; }
     </style>
     """, unsafe_allow_html=True)
 
-st.title("🐹 倉鼠量化戰情室：動能突破搜尋器")
-st.info("策略邏輯：過去30天曾低於200MA + 今日站上200MA + 均線多頭(5>10>20) + 成交量爆發(>1.5倍)")
-
-# --- 核心功能：抓取全台股清單 ---
+# --- 第一部分：自動抓取全台股清單 (修正 SSL 與 編碼問題) ---
 @st.cache_data(ttl=86400)
-def get_all_taiwan_stock_tickers():
+def get_taiwan_stock_list():
     """從證交所抓取所有上市與上櫃股票代碼"""
     urls = {
         "上市": "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2",
         "上櫃": "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"
     }
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+    
     all_tickers = []
+    
     for market, url in urls.items():
         try:
-            response = requests.get(url)
+            # 加入 verify=False 解決 SSL 錯誤
+            response = requests.get(url, verify=False, headers=headers)
+            response.encoding = 'big5' 
             soup = BeautifulSoup(response.text, 'html.parser')
             table = soup.find('table', {'class': 'h4'})
-            for row in table.find_all('tr')[2:]:
+            
+            if not table: continue
+            
+            rows = table.find_all('tr')
+            for row in rows[2:]:
                 cols = row.find_all('td')
                 if len(cols) > 0:
                     text = cols[0].text.strip()
-                    parts = text.split('\u3000')
-                    # 篩選標準 4 位數股票代碼
+                    parts = text.split('\u3000') # 處理全形空格
                     if len(parts) == 2 and len(parts[0]) == 4:
                         ticker = parts[0]
+                        name = parts[1]
                         suffix = ".TW" if market == "上市" else ".TWO"
-                        all_tickers.append(f"{ticker}{suffix}")
+                        all_tickers.append({"ticker": f"{ticker}{suffix}", "name": name, "market": market})
         except Exception as e:
-            st.error(f"抓取{market}清單失敗: {e}")
-    return all_tickers
+            st.error(f"抓取 {market} 清單失敗: {e}")
+            
+    return pd.DataFrame(all_tickers)
 
-# --- 核心功能：分析單一股票動能 ---
-def analyze_stock(ticker):
+# --- 第二部分：量化篩選邏輯 ---
+def check_momentum(ticker_row):
+    ticker = ticker_row['ticker']
+    name = ticker_row['name']
     try:
-        # 下載 1.5 年的數據以確保 200MA 計算準確
+        # 下載足以計算 200MA 的資料
         df = yf.download(ticker, period="14mo", progress=False)
-        if len(df) < 210:
-            return None
+        if len(df) < 210: return None
 
-        # 計算技術指標
+        # 計算均線
         df['MA5'] = df['Close'].rolling(window=5).mean()
         df['MA10'] = df['Close'].rolling(window=10).mean()
         df['MA20'] = df['Close'].rolling(window=20).mean()
         df['MA200'] = df['Close'].rolling(window=200).mean()
         df['VMA20'] = df['Volume'].rolling(window=20).mean()
 
-        # 取得最新與歷史數據
-        current = df.iloc[-1]
-        prev_30_days = df.iloc[-31:-1] # 過去 30 個交易日
+        curr = df.iloc[-1]
+        prev_30_days = df.iloc[-31:-1]
 
-        # 條件 1：底部突破 (過去30天曾低於 200MA，且現在高於 200MA)
+        # 條件 1: 過去30天曾低於 200MA，且現在高於 200MA (剛突破)
         was_below_200 = (prev_30_days['Close'] < prev_30_days['MA200']).any()
-        is_above_200 = current['Close'] > current['MA200']
+        is_above_200 = curr['Close'] > curr['MA200']
 
-        # 條件 2：均線多頭排列 (5MA > 10MA > 20MA)
-        ma_alignment = current['MA5'] > current['MA10'] > current['MA20']
+        # 條件 2: 5MA > 10MA > 20MA (多頭排列)
+        ma_aligned = curr['MA5'] > curr['MA10'] > curr['MA20']
 
-        # 條件 3：成交量爆發 (今日量 > 20日均量 * 1.5)
-        volume_spike = current['Volume'] > (current['VMA20'] * 1.5)
+        # 條件 3: 成交量爆發 (今日量 > 20日均量 * 1.5)
+        vol_ratio = float(curr['Volume'] / curr['VMA20'])
+        vol_spike = vol_ratio > 1.5
 
-        if was_below_200 and is_above_200 and ma_alignment and volume_spike:
+        if was_below_200 and is_above_200 and ma_aligned and vol_spike:
             return {
-                "代碼": ticker.split('.')[0],
-                "現價": round(float(current['Close']), 2),
-                "5MA": round(float(current['MA5']), 2),
-                "20MA": round(float(current['MA20']), 2),
-                "200MA": round(float(current['MA200']), 2),
-                "成交量倍數": round(float(current['Volume'] / current['VMA20']), 2),
-                "今日成交量": int(current['Volume'])
+                "代碼": ticker.replace(".TW", "").replace(".TWO", ""),
+                "名稱": name,
+                "現價": round(float(curr['Close']), 2),
+                "成交量倍數": round(vol_ratio, 2),
+                "5MA": round(float(curr['MA5']), 2),
+                "200MA": round(float(curr['MA200']), 2),
+                "市場": ticker_row['market']
             }
     except:
         return None
     return None
 
-# --- UI 側邊欄 ---
-st.sidebar.header("⚙️ 掃描設定")
-all_stocks = get_all_taiwan_stock_tickers()
-st.sidebar.success(f"已更新全台股清單：共 {len(all_stocks)} 檔")
+# --- 第三部分：Streamlit UI 介面 ---
+st.title("🛡️ 倉鼠量化戰情室")
+st.subheader("台股「初升段」動能篩選器")
 
-# 為了防止 Demo 跑太久，可以讓用戶選範圍
-sample_size = st.sidebar.slider("掃描樣本數", 50, len(all_stocks), 200)
-sort_by = st.sidebar.selectbox("排序方式", ["成交量倍數", "現價"])
+with st.expander("📌 策略說明"):
+    st.write("""
+    1. **新突破**：過去 30 天曾跌破 200 日線，確保不是漲很久的股票，而是新轉強的。
+    2. **多頭排列**：短、中、長期均線依序排列，動能正在加速。
+    3. **量能增溫**：今日成交量大於過去 20 日平均的 1.5 倍，代表大戶開始進場。
+    """)
 
-# --- 執行掃描 ---
-if st.button("🚀 開始全市場掃描 (倉鼠出擊)"):
+# 側邊欄控制
+df_stocks = get_taiwan_stock_list()
+st.sidebar.header("搜尋範圍")
+market_choice = st.sidebar.multiselect("選擇市場", ["上市", "上櫃"], default=["上市", "上櫃"])
+limit = st.sidebar.slider("掃描前 N 檔 (節省時間)", 100, len(df_stocks), 300)
+
+if st.button("🚀 開始掃描全市場"):
+    filtered_list = df_stocks[df_stocks['market'].isin(market_choice)].head(limit)
+    
     results = []
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # 執行掃描
-    target_list = all_stocks[:sample_size]
     start_time = time.time()
     
-    for i, ticker in enumerate(target_list):
-        status_text.text(f"🔍 正在分析: {ticker} ({i+1}/{len(target_list)})")
-        data = analyze_stock(ticker)
-        if data:
-            results.append(data)
-        progress_bar.progress
+    for i, (_, row) in enumerate(filtered_list.iterrows()):
+        status_text.text(f"正在分析 {row['ticker']} {row['name']}...")
+        res = check_momentum(row)
+        if res:
+            results.append(res)
+        progress_bar.progress((i + 1) / len(filtered_list))
+        
+    end_time = time.time()
+    status_text.success(f"掃描完成！耗時 {round(end_time - start_time, 1)} 秒")
+    
+    if results:
+        res_df = pd.DataFrame(results)
+        st.success(f"🔥 篩選結果：發現 {len(results)} 檔符合條件")
+        # 依成交量倍數排序
+        st.dataframe(res_df.sort_values(by="成交量倍數", ascending=False), use_container_width=True, hide_index=True)
+        
+        # 下載功能
+        csv = res_df.to_csv(index=False).encode('utf-8-sig')
+        st.download_button("📥 下載篩選清單", csv, "hamster_report.csv", "text/csv")
+    else:
+        st.warning("☹️ 目前市場沒有符合條件的標的。")
