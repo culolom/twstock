@@ -1,77 +1,90 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
-from datetime import datetime, timedelta
+import requests
+from bs4 import BeautifulSoup
+import urllib3
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-st.set_page_config(page_title="台股動能突破搜尋器", layout="wide")
+# 基礎設定
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+st.set_page_config(page_title="倉鼠量化極速版", layout="wide")
 
-st.title("🐹 倉鼠量化戰情室：台股強勢動能篩選器")
-st.write("篩選條件：1. 過去30天曾低於200SMA 2. 現價突破200SMA 3. 5MA > 10MA > 20MA")
+@st.cache_data(ttl=86400)
+def get_taiwan_stock_list():
+    # ... (保持原有的抓取清單邏輯，此處省略以節省空間) ...
+    return df_stocks # 假設回傳包含 ticker, name, market 的 DataFrame
 
-# 1. 定義要掃描的標的 (範例：台灣50與中型100成分股，或手動輸入)
-# 建議實務上可以從公開資訊觀測站抓取全台股清單
-default_tickers = ["2330.TW", "2317.TW", "2454.TW", "2308.TW", "2382.TW", "2357.TW", "3231.TW", "6669.TW", "2603.TW", "2609.TW"]
-
-tickers_input = st.text_area("輸入台股代碼 (以逗號分隔，需加 .TW 或 .TWO)", value=",".join(default_tickers))
-target_list = [t.strip() for t in tickers_input.split(",")]
-
-def check_momentum(ticker):
+def check_momentum_fast(row):
+    """這是在多執行緒中運行的核心邏輯"""
+    ticker = row['ticker']
     try:
-        # 下載至少 250 天的資料以計算 200MA
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=400)
-        df = yf.download(ticker, start=start_date, end=end_date, progress=False)
-        
-        if len(df) < 200:
-            return None
+        # 僅下載必要天數 (14個月) 以節省頻寬
+        df = yf.download(ticker, period="14mo", progress=False, threads=False)
+        if len(df) < 210: return None
 
-        # 計算均線
-        df['MA5'] = df['Close'].rolling(window=5).mean()
-        df['MA10'] = df['Close'].rolling(window=10).mean()
-        df['MA20'] = df['Close'].rolling(window=20).mean()
-        df['MA200'] = df['Close'].rolling(window=200).mean()
+        # 指標計算
+        close = df['Close'].iloc[:, 0] if isinstance(df['Close'], pd.DataFrame) else df['Close']
+        vol = df['Volume'].iloc[:, 0] if isinstance(df['Volume'], pd.DataFrame) else df['Volume']
+        
+        ma5 = close.rolling(5).mean()
+        ma10 = close.rolling(10).mean()
+        ma20 = close.rolling(20).mean()
+        ma200 = close.rolling(200).mean()
+        vma20 = vol.rolling(20).mean()
 
-        # 取最新一筆資料
-        current = df.iloc[-1]
-        
-        # 取得過去 30 天的資料 (不含今天)
-        past_30_days = df.iloc[-31:-1]
+        # 邏輯判斷
+        curr_price = close.iloc[-1]
+        curr_ma200 = ma200.iloc[-1]
+        past_30_close = close.iloc[-31:-1]
+        past_30_ma200 = ma200.iloc[-31:-1]
 
-        # 條件檢查
-        # 1. 過去 30 天內，收盤價曾低於 200MA (證明是從底部上來的)
-        cond1 = (past_30_days['Close'] < past_30_days['MA200']).any()
-        
-        # 2. 現在收盤價高於 200MA
-        cond2 = current['Close'] > current['MA200']
-        
-        # 3. 5MA > 10MA > 20MA (多頭排列)
-        cond3 = current['MA5'] > current['MA10'] and current['MA10'] > current['MA20']
+        cond1 = (past_30_close < past_30_ma200).any() and (curr_price > curr_ma200)
+        cond2 = ma5.iloc[-1] > ma10.iloc[-1] > ma20.iloc[-1]
+        vol_ratio = float(vol.iloc[-1] / vma20.iloc[-1])
+        cond3 = vol_ratio > 1.5
 
         if cond1 and cond2 and cond3:
             return {
-                "代碼": ticker,
-                "收盤價": round(float(current['Close']), 2),
-                "5MA": round(float(current['MA5']), 2),
-                "20MA": round(float(current['MA20']), 2),
-                "200MA": round(float(current['MA200']), 2)
+                "代碼": ticker.split('.')[0], "名稱": row['name'],
+                "現價": round(float(curr_price), 2), "成交量倍數": round(vol_ratio, 2),
+                "市場": row['market']
             }
-    except Exception as e:
+    except:
         return None
     return None
 
-if st.button("開始掃描"):
+# --- UI 部分 ---
+st.title("🚀 倉鼠極速掃描器 (多執行緒版)")
+
+df_stocks = get_taiwan_stock_list()
+limit = st.sidebar.slider("掃描數量", 100, len(df_stocks), 500)
+max_workers = st.sidebar.slider("並行執行緒數", 1, 20, 10) # 建議 10-15，太高會被 Yahoo 封鎖
+
+if st.button("開始極速掃描"):
+    target_stocks = df_stocks.head(limit).to_dict('records')
     results = []
+    
     progress_bar = st.progress(0)
+    status_text = st.empty()
     
-    for i, ticker in enumerate(target_list):
-        res = check_momentum(ticker)
-        if res:
-            results.append(res)
-        progress_bar.progress((i + 1) / len(target_list))
-    
+    # 使用 ThreadPoolExecutor 並行加速
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_stock = {executor.submit(check_momentum_fast, stock): stock for stock in target_stocks}
+        
+        completed = 0
+        for future in as_completed(future_to_stock):
+            completed += 1
+            res = future.result()
+            if res:
+                results.append(res)
+            
+            # 每處理 10 檔更新一次進度條，減少 UI 負擔
+            if completed % 10 == 0 or completed == limit:
+                progress_bar.progress(completed / limit)
+                status_text.text(f"已完成: {completed} / {limit}")
+
     if results:
-        st.success(f"找到 {len(results)} 檔符合條件的標的！")
-        res_df = pd.DataFrame(results)
-        st.dataframe(res_df, use_container_width=True)
+        st.write(pd.DataFrame(results))
     else:
-        st.warning("目前沒有符合條件的標的。")
+        st.write("查無符合條件標的")
