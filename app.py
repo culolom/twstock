@@ -8,9 +8,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-st.set_page_config(page_title="倉鼠量化戰情室 - 精準版", layout="wide", page_icon="🐹")
+st.set_page_config(page_title="倉鼠戰情室 - 金居模式", layout="wide", page_icon="🐹")
 
-@st.cache_data(ttl=3600) # 改為一小時更新一次清單
+# --- 抓取台股清單 ---
+@st.cache_data(ttl=86400)
 def get_taiwan_stock_list():
     urls = {"上市": "https://isin.twse.com.tw/isin/C_public.jsp?strMode=2", "上櫃": "https://isin.twse.com.tw/isin/C_public.jsp?strMode=4"}
     headers = {'User-Agent': 'Mozilla/5.0'}
@@ -30,62 +31,84 @@ def get_taiwan_stock_list():
         except: pass
     return pd.DataFrame(all_stocks)
 
-def scan_logic(row, max_dist):
+# --- 核心邏輯：金居起漲模式 ---
+def scan_jinju_pattern(row, max_dist_60):
     ticker = row['ticker']
     try:
-        # 重點：auto_adjust=False 確保使用原始收盤價，與看盤軟體一致
-        df = yf.download(ticker, period="15mo", progress=False, threads=False, auto_adjust=False)
-        if len(df) < 210: return None
+        # 下載足以計算 200MA 與 240MA 的資料
+        df = yf.download(ticker, period="18mo", progress=False, threads=False, auto_adjust=False)
+        if len(df) < 240: return None
 
         close = df['Close'].squeeze()
         volume = df['Volume'].squeeze()
-        last_date = df.index[-1].strftime('%Y-%m-%d')
         
-        # 均線計算 (SMA)
-        ma5 = close.rolling(5).mean()
-        ma10 = close.rolling(10).mean()
-        ma20 = close.rolling(20).mean()
-        ma200 = close.rolling(200).mean()
-        vma20 = volume.rolling(20).mean()
+        # 技術指標計算
+        ma5 = close.rolling(5).mean().iloc[-1]
+        ma10 = close.rolling(10).mean().iloc[-1]
+        ma20 = close.rolling(20).mean().iloc[-1]
+        ma60 = close.rolling(60).mean().iloc[-1] # 季線
+        ma200 = close.rolling(200).mean().iloc[-1] # 年線
+        vma20 = volume.rolling(20).mean().iloc[-1]
 
-        c_p = close.iloc[-1]
-        m5, m10, m20, m200 = ma5.iloc[-1], ma10.iloc[-1], ma20.iloc[-1], ma200.iloc[-1]
+        curr_p = close.iloc[-1]
         
-        # 條件檢查
-        prev_5_close = close.iloc[-6:-1]
-        prev_5_ma200 = ma200.iloc[-6:-1]
-        was_below = (prev_5_close < prev_5_ma200).any()
+        # 條件 1：全均線多頭排列 (5 > 10 > 20 > 60 > 200)
+        # 這是金居 2025/7/8 之後噴發的標準型態
+        is_aligned = ma5 > ma10 > ma20 > ma60 > ma200
         
-        perfect_align = m5 > m10 > m20 > m200
-        vol_ratio = float(volume.iloc[-1] / vma20.iloc[-1])
-        dist = ((m5 / m200) - 1) * 100
+        # 條件 2：帶量突破 (今日量 > 20日均量 1.5倍)
+        vol_spike = (volume.iloc[-1] / vma20) > 1.5
+        
+        # 條件 3：距離季線不要太遠 (確保還在起漲段)
+        dist_from_60 = ((curr_p / ma60) - 1) * 100
+        near_60 = dist_from_60 <= max_dist_60
 
-        if was_below and c_p > m200 and perfect_align and vol_ratio > 1.5 and dist <= max_dist:
+        # 條件 4：過去 5 天曾靠近或低於年線 (符合你之前的方案 A 突破邏輯)
+        prev_5_low = close.iloc[-6:-1].min()
+        was_near_200 = prev_5_low < (ma200 * 1.02) # 只要跌破或靠近年線 2% 內
+
+        if is_aligned and vol_spike and near_60 and was_near_200:
             return {
-                "日期": last_date, "代碼": ticker.split('.')[0], "名稱": row['name'],
-                "現價": round(float(c_p), 2), "量增倍數": round(vol_ratio, 2),
-                "5MA": round(float(m5), 2), "200MA": round(float(m200), 2),
-                "離年線%": round(dist, 2)
+                "代碼": ticker.split('.')[0],
+                "名稱": row['name'],
+                "現價": round(float(curr_p), 2),
+                "量增倍數": round(float(volume.iloc[-1] / vma20), 2),
+                "季線距離%": round(dist_from_60, 2),
+                "季線價格": round(float(ma60), 2),
+                "年線價格": round(float(ma200), 2)
             }
     except: return None
+    return None
 
-st.title("🛡️ 倉鼠量化戰情室 (精準同步版)")
-st.sidebar.header("參數調整")
-max_dist = st.sidebar.slider("5MA/200MA 最大乖離 %", 2.0, 15.0, 10.0)
-scan_limit = st.sidebar.slider("掃描數量", 100, 1000, 300)
+# --- UI 介面 ---
+st.title("🛡️ 倉鼠量化戰情室 - 金居起漲模式")
+st.markdown("### 標的特徵：均線全排列 + 季線上方起跳")
 
-if st.button("🚀 開始全市場戰情掃描"):
-    stocks = get_taiwan_stock_list().head(scan_limit).to_dict('records')
+df_all = get_taiwan_stock_list()
+st.sidebar.header("⚙️ 戰情參數")
+max_dist_60 = st.sidebar.slider("離季線最大距離 % (起漲門檻)", 2.0, 15.0, 8.0)
+scan_num = st.sidebar.slider("掃描數量", 100, len(df_all), 500)
+
+if st.button("🚀 執行全市場掃描"):
+    stocks = df_all.head(scan_num).to_dict('records')
     results = []
     p = st.progress(0)
+    status = st.empty()
+    
     with ThreadPoolExecutor(max_workers=15) as ex:
-        futures = {ex.submit(scan_logic, s, max_dist): s for s in stocks}
+        futures = {ex.submit(scan_jinju_pattern, s, max_dist_60): s for s in stocks}
         for i, f in enumerate(as_completed(futures)):
             res = f.result()
             if res: results.append(res)
-            p.progress((i+1)/len(stocks))
-            
+            if (i+1) % 10 == 0:
+                p.progress((i+1)/len(stocks))
+                status.text(f"已分析 {i+1} 檔... 找到 {len(results)} 檔標的")
+
     if results:
-        st.dataframe(pd.DataFrame(results).sort_values("量增倍數", ascending=False), hide_index=True)
+        st.balloons()
+        st.subheader(f"🔥 發現 {len(results)} 檔符合「金居模式」標的")
+        res_df = pd.DataFrame(results).sort_values("量增倍數", ascending=False)
+        st.dataframe(res_df, use_container_width=True, hide_index=True)
+        st.info("💡 策略提示：此清單標的皆為全均線多頭排列。如你所說，跌破季線 ($60MA$) 可考慮出場。")
     else:
-        st.warning("查無標的。")
+        st.warning("查無符合金居模式之標的。")
